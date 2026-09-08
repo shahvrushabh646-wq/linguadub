@@ -38,33 +38,30 @@ function run(cmd,args,cwd=ROOT){
     p.on('close',code=>code===0?resolve(out):reject(new Error(`${cmd} failed (${code}): ${err.slice(-3000)}`)));
   });
 }
-
 function normalizeYouTubeUrl(value){
   let url=String(value||'').trim();
   if(!/^https?:\/\//i.test(url))url=`https://${url}`;
   return url;
 }
 function validYouTubeUrl(value){
-  try{
-    const u=new URL(normalizeYouTubeUrl(value));
-    return /(^|\.)youtube\.com$|(^|\.)youtu\.be$/i.test(u.hostname);
-  }catch{return false}
+  try{const u=new URL(normalizeYouTubeUrl(value));return /(^|\.)youtube\.com$|(^|\.)youtu\.be$/i.test(u.hostname)}catch{return false}
 }
+function setJob(id,patch){const old=jobs.get(id)||{id};jobs.set(id,{...old,...patch})}
 
 async function translate(text,target){
-  if(!openai)throw new Error('OPENAI_API_KEY is not configured');
+  if(!openai)throw new Error('OPENAI_API_KEY is not configured on the server.');
   const model=process.env.OPENAI_TEXT_MODEL||'gpt-5.6-luna';
   const r=await openai.responses.create({model,input:`Translate the following spoken-video transcript into ${target}. Preserve meaning, names and numbers. Return only the translated spoken script, with no commentary.\n\n${text}`});
   return r.output_text.trim();
 }
 async function transcribe(audioPath){
-  if(!openai)throw new Error('OPENAI_API_KEY is not configured');
+  if(!openai)throw new Error('OPENAI_API_KEY is not configured on the server.');
   const model=process.env.OPENAI_TRANSCRIBE_MODEL||'gpt-4o-transcribe';
   const r=await openai.audio.transcriptions.create({file:createReadStream(audioPath),model});
   return r.text;
 }
 async function tts(text,language,outPath){
-  if(!openai)throw new Error('OPENAI_API_KEY is not configured');
+  if(!openai)throw new Error('OPENAI_API_KEY is not configured on the server.');
   const model=process.env.OPENAI_TTS_MODEL||'gpt-4o-mini-tts';
   const voice=process.env.OPENAI_TTS_VOICE||'alloy';
   const speech=await openai.audio.speech.create({model,voice,input:text,response_format:'mp3',instructions:`Speak naturally in ${language}. Clear dubbing voice, moderate pace.`});
@@ -75,26 +72,29 @@ async function processJob(job){
   const dir=path.join(ROOT,job.id);
   await fs.mkdir(dir,{recursive:true});
   try{
-    jobs.set(job.id,{...job,status:'downloading',progress:10});
+    setJob(job.id,{status:'downloading',progress:10});
     const input=path.join(dir,'source.mp4');
-    if(job.url)await run(YTDLP,['--no-playlist','--no-warnings','--merge-output-format','mp4','-o',input,job.url]);
-    else await fs.copyFile(job.uploadPath,input);
-    jobs.set(job.id,{...job,status:'extracting audio',progress:25});
+    if(job.url){
+      await run(YTDLP,['--no-playlist','--no-warnings','--merge-output-format','mp4','-o',input,job.url]);
+    }else await fs.copyFile(job.uploadPath,input);
+    setJob(job.id,{status:'extracting audio',progress:25});
     const audio=path.join(dir,'source.mp3');
     await run(FFMPEG,['-y','-i',input,'-vn','-ac','1','-ar','16000','-b:a','64k',audio]);
-    jobs.set(job.id,{...job,status:'transcribing',progress:40});
+    setJob(job.id,{status:'transcribing',progress:40});
     const transcript=await transcribe(audio);
-    jobs.set(job.id,{...job,status:'translating',progress:55});
+    if(!transcript?.trim())throw new Error('No spoken audio was detected in the video.');
+    setJob(job.id,{status:'translating',progress:55});
     const translated=await translate(transcript,job.language);
-    jobs.set(job.id,{...job,status:'generating voice',progress:72});
+    if(!translated?.trim())throw new Error('Translation returned empty text.');
+    setJob(job.id,{status:'generating voice',progress:72});
     const dubbed=path.join(dir,'dub.mp3');
     await tts(translated,job.language,dubbed);
-    jobs.set(job.id,{...job,status:'rendering video',progress:88});
+    setJob(job.id,{status:'rendering video',progress:88});
     const output=path.join(dir,'translated.mp4');
     await run(FFMPEG,['-y','-i',input,'-i',dubbed,'-map','0:v:0','-map','1:a:0','-c:v','copy','-c:a','aac','-b:a','128k',output]);
-    jobs.set(job.id,{...job,status:'ready',progress:100,videoUrl:`/files/${job.id}/translated.mp4`});
+    setJob(job.id,{status:'ready',progress:100,videoUrl:`/files/${job.id}/translated.mp4`});
   }catch(e){
-    jobs.set(job.id,{...job,status:'error',progress:0,error:e.message});
+    setJob(job.id,{status:'error',progress:0,error:e?.message||'Dubbing failed.'});
   }finally{
     if(job.uploadPath)try{await fs.unlink(job.uploadPath)}catch{}
   }
@@ -102,31 +102,36 @@ async function processJob(job){
 
 app.get('/api/health',(req,res)=>res.json({ok:true,openaiConfigured:Boolean(openai),ffmpeg:FFMPEG,ytDlp:YTDLP}));
 app.post('/api/dub',async(req,res)=>{
-  const {url,targetLanguage,language}=req.body||{};
-  const lang=targetLanguage||language;
-  const normalized=normalizeYouTubeUrl(url);
-  if(!validYouTubeUrl(normalized))return res.status(400).json({error:'Enter a valid YouTube URL.'});
-  if(!langCodes[lang])return res.status(400).json({error:'Unsupported target language.'});
-  const id=crypto.randomUUID();
-  const job={id,url:normalized,language:lang,status:'queued',progress:0};
-  jobs.set(id,job);
-  processJob(job);
-  res.status(202).json({jobId:id,status:'queued'});
+  try{
+    const {url,targetLanguage,language}=req.body||{};
+    const lang=targetLanguage||language;
+    const normalized=normalizeYouTubeUrl(url);
+    if(!validYouTubeUrl(normalized))return res.status(400).json({error:'Enter a valid YouTube URL.'});
+    if(!langCodes[lang])return res.status(400).json({error:'Unsupported target language.'});
+    if(!openai)return res.status(503).json({error:'Dubbing is not configured yet. Add OPENAI_API_KEY to the production server.'});
+    const id=crypto.randomUUID();
+    const job={id,url:normalized,language:lang,status:'queued',progress:0};
+    jobs.set(id,job);
+    processJob(job).catch(e=>setJob(id,{status:'error',progress:0,error:e?.message||'Dubbing failed.'}));
+    res.status(202).json({jobId:id,status:'queued'});
+  }catch(e){res.status(500).json({error:e?.message||'Could not start dubbing.'})}
 });
 app.post('/api/dub/upload',upload.single('video'),async(req,res)=>{
-  const lang=req.body?.targetLanguage;
-  if(!req.file||!langCodes[lang])return res.status(400).json({error:'Video and supported target language are required.'});
-  const id=crypto.randomUUID();
-  const job={id,uploadPath:req.file.path,language:lang,status:'queued',progress:0};
-  jobs.set(id,job);
-  processJob(job);
-  res.status(202).json({jobId:id,status:'queued'});
+  try{
+    const lang=req.body?.targetLanguage;
+    if(!req.file||!langCodes[lang])return res.status(400).json({error:'Video and supported target language are required.'});
+    if(!openai){try{await fs.unlink(req.file.path)}catch{};return res.status(503).json({error:'Dubbing is not configured yet. Add OPENAI_API_KEY to the production server.'})}
+    const id=crypto.randomUUID();
+    const job={id,uploadPath:req.file.path,language:lang,status:'queued',progress:0};
+    jobs.set(id,job);
+    processJob(job).catch(e=>setJob(id,{status:'error',progress:0,error:e?.message||'Dubbing failed.'}));
+    res.status(202).json({jobId:id,status:'queued'});
+  }catch(e){res.status(500).json({error:e?.message||'Could not start dubbing.'})}
 });
 app.get('/api/dub/:id',(req,res)=>{
   const j=jobs.get(req.params.id);
   if(!j)return res.status(404).json({error:'Job not found'});
-  const {uploadPath,...safe}=j;
-  res.json(safe);
+  const {uploadPath,...safe}=j;res.json(safe);
 });
 
 app.use(express.static(DIST));
