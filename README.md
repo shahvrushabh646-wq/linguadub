@@ -39,3 +39,7 @@ The frontend uses `/api` by default and can be pointed to another backend with `
 - Long videos may take longer than one minute.
 - AI/API usage can incur provider charges.
 - Use only videos you own or are authorized to download/process, and follow the source platform's terms. Do not bypass DRM or access controls.
+
+## Deployment
+- Vercel container deployment uses `Dockerfile.vercel` and the production environment variables configured in the Vercel project.
+- After changing production environment variables, create a new deployment so the container receives the updated values.
