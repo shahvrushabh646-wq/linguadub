@@ -10,7 +10,7 @@ import crypto from 'node:crypto';
 import OpenAI from 'openai';
 import dotenv from 'dotenv';
 dotenv.config();
-const app=express(),PORT=Number(process.env.PORT||8787),FFMPEG=process.env.FFMPEG_PATH||ffmpegPath||'ffmpeg',YTDLP=process.env.YTDLP_PATH||'yt-dlp',ROOT=process.env.WORK_DIR||path.resolve('server-data');
+const app=express(),PORT=Number(process.env.PORT||8787),FFMPEG=process.env.FFMPEG_PATH||ffmpegPath||'ffmpeg',YTDLP=process.env.YTDLP_PATH||'yt-dlp',ROOT=process.env.WORK_DIR||path.resolve('server-data'),DIST=path.resolve('dist');
 await fs.mkdir(ROOT,{recursive:true});await fs.mkdir(path.join(ROOT,'uploads'),{recursive:true});
 app.use(cors());app.use(express.json({limit:'2mb'}));app.use('/files',express.static(ROOT));
 const upload=multer({dest:path.join(ROOT,'uploads'),limits:{fileSize:500*1024*1024}}),jobs=new Map();
@@ -25,4 +25,6 @@ app.get('/api/health',(req,res)=>res.json({ok:true,openaiConfigured:Boolean(open
 app.post('/api/dub',async(req,res)=>{const {url,targetLanguage,language}=req.body||{},lang=targetLanguage||language;if(!url||!/^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//i.test(url))return res.status(400).json({error:'Enter a valid YouTube URL.'});if(!langCodes[lang])return res.status(400).json({error:'Unsupported target language.'});const id=crypto.randomUUID(),job={id,url,language:lang,status:'queued',progress:0};jobs.set(id,job);processJob(job);res.status(202).json({jobId:id})});
 app.post('/api/dub/upload',upload.single('video'),async(req,res)=>{const lang=req.body?.targetLanguage;if(!req.file||!langCodes[lang])return res.status(400).json({error:'Video and supported target language are required.'});const id=crypto.randomUUID(),job={id,uploadPath:req.file.path,language:lang,status:'queued',progress:0};jobs.set(id,job);processJob(job);res.status(202).json({jobId:id})});
 app.get('/api/dub/:id',(req,res)=>{const j=jobs.get(req.params.id);if(!j)return res.status(404).json({error:'Job not found'});const {uploadPath,...safe}=j;res.json(safe)});
-app.listen(PORT,()=>console.log(`LinguaDub API listening on http://localhost:${PORT}`));
+app.use(express.static(DIST));
+app.use((req,res,next)=>{if(req.method!=='GET'||req.path.startsWith('/api/')||req.path.startsWith('/files/'))return next();res.sendFile(path.join(DIST,'index.html'))});
+app.listen(PORT,()=>console.log(`LinguaDub listening on port ${PORT}`));
