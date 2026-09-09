@@ -78,18 +78,17 @@ async function translate(text,target){
   await Promise.all(Array.from({length:workers},worker));return out.join(' ');
 }
 async function tts(text,language,outPath,dir){
-  const voice=voices[language];if(!voice)throw new Error(`No voice configured for ${language}.`);const parts=splitText(text,3000),files=new Array(parts.length),workers=Math.min(4,parts.length);let next=0;
-  async function worker(){while(true){const i=next++;if(i>=parts.length)return;const txt=path.join(dir,`tts-${i}.txt`),mp3=path.join(dir,`tts-${i}.mp3`);await fs.writeFile(txt,parts[i],'utf8');await run(EDGETTS,['--voice',voice,'--file',txt,'--write-media',mp3]);files[i]=mp3;}}
+  const voice=voices[language];if(!voice)throw new Error(`No voice configured for ${language}.`);const parts=splitText(text,3000),files=new Array(parts.length),workers=Math.min(3,parts.length);let next=0;
+  async function worker(){while(true){const i=next++;if(i>=parts.length)return;const mp3=path.join(dir,`tts-${i}.mp3`);await run(EDGETTS,['--voice',voice,'--text',parts[i],'--write-media',mp3]);files[i]=mp3;}}
   await Promise.all(Array.from({length:workers},worker));
   if(files.length===1){await fs.copyFile(files[0],outPath);return;}
-  const list=path.join(dir,'tts-list.txt');await fs.writeFile(list,files.map(f=>`file '${f.replaceAll("'","'\\''")}'`).join('\n'),'utf8');await run(FFMPEG,['-y','-f','concat','-safe','0','-i',list,'-c','copy',outPath]);
+  const list=path.join(dir,'tts-list.txt');await fs.writeFile(list,files.map(f=>`file '${f.replaceAll("'","'\\''")}'`).join('\n'),'utf8');await run(FFMPEG,['-y','-f','concat','-safe','0','-i',list,'-c:a','libmp3lame','-b:a','128k',outPath]);
 }
 async function processJob(job){
   const dir=path.join(ROOT,job.id);await fs.mkdir(dir,{recursive:true});
   try{
     setJob(job.id,{status:'starting',progress:5});const input=path.join(dir,'source.mp4');
     if(job.url){
-      // Download the video and fetch captions at the same time. Original audio is not downloaded.
       setJob(job.id,{status:'downloading + captions',progress:12});
       await Promise.all([
         run(YTDLP,['--no-playlist','--no-warnings','--concurrent-fragments','8','-f','bv*[ext=mp4][vcodec^=avc1]/bv*[ext=mp4]/b[ext=mp4]','-o',input,job.url]),
@@ -101,7 +100,10 @@ async function processJob(job){
     const translated=await translate(transcript,langCodes[job.language]);
     setJob(job.id,{status:'generating voice',progress:70});const dubbed=path.join(dir,'dub.mp3');await tts(translated,job.language,dubbed,dir);
     setJob(job.id,{status:'rendering video',progress:90});const output=path.join(dir,'translated.mp4');
-    await run(FFMPEG,['-y','-i',input,'-i',dubbed,'-map','0:v:0','-map','1:a:0','-c:v','copy','-c:a','aac','-b:a','128k','-movflags','+faststart',output]);
+    await run(FFMPEG,['-y','-i',input,'-i',dubbed,'-map','0:v:0','-map','1:a:0','-c:v','copy','-c:a','aac','-b:a','128k','-shortest','-movflags','+faststart',output]);
+    // Verify that the final MP4 actually contains an audio stream before reporting success.
+    const probe=await run('ffprobe',['-v','error','-select_streams','a:0','-show_entries','stream=codec_name','-of','default=nw=1:nk=1',output]);
+    if(!probe.trim())throw new Error('Dubbed audio was not present in the final MP4.');
     setJob(job.id,{status:'ready',progress:100,videoUrl:`/files/${job.id}/translated.mp4`});
   }catch(e){setJob(job.id,{status:'error',progress:0,error:e?.message||'Dubbing failed.'});}
   finally{if(job.uploadPath)await fs.unlink(job.uploadPath).catch(()=>{});}
