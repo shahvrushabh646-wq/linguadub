@@ -66,10 +66,16 @@ async function translateChunk(text,target){
   const endpoint=new URL('https://translate.googleapis.com/translate_a/single');endpoint.searchParams.set('client','gtx');endpoint.searchParams.set('sl','auto');endpoint.searchParams.set('tl',target);endpoint.searchParams.set('dt','t');endpoint.searchParams.set('q',text);
   const response=await fetch(endpoint);if(!response.ok)throw new Error(`Translation service returned ${response.status}.`);const data=await response.json();const translated=Array.isArray(data?.[0])?data[0].map(x=>x?.[0]||'').join(''):'';if(!translated.trim())throw new Error('Translation returned empty text.');return translated.trim();
 }
-async function translate(text,target){const out=[];for(const part of splitText(text,3500))out.push(await translateChunk(part,target));return out.join(' ');}
+async function translate(text,target){
+  const parts=splitText(text,3500),out=new Array(parts.length),workers=Math.min(3,parts.length);
+  let next=0;
+  async function worker(){while(true){const i=next++;if(i>=parts.length)return;out[i]=await translateChunk(parts[i],target);}}
+  await Promise.all(Array.from({length:workers},worker));
+  return out.join(' ');
+}
 async function tts(text,language,outPath,dir){
-  const voice=voices[language];if(!voice)throw new Error(`No voice configured for ${language}.`);const files=[];
-  for(let i=0;i<splitText(text,2800).length;i++){const part=splitText(text,2800)[i],txt=path.join(dir,`tts-${i}.txt`),mp3=path.join(dir,`tts-${i}.mp3`);await fs.writeFile(txt,part,'utf8');await run(EDGETTS,['--voice',voice,'--file',txt,'--write-media',mp3]);files.push(mp3);}
+  const voice=voices[language];if(!voice)throw new Error(`No voice configured for ${language}.`);const files=[];const parts=splitText(text,2800);
+  for(let i=0;i<parts.length;i++){const part=parts[i],txt=path.join(dir,`tts-${i}.txt`),mp3=path.join(dir,`tts-${i}.mp3`);await fs.writeFile(txt,part,'utf8');await run(EDGETTS,['--voice',voice,'--file',txt,'--write-media',mp3]);files.push(mp3);}
   if(files.length===1){await fs.copyFile(files[0],outPath);return;}
   const list=path.join(dir,'tts-list.txt');await fs.writeFile(list,files.map(f=>`file '${f.replaceAll("'","'\\''")}'`).join('\n'),'utf8');await run(FFMPEG,['-y','-f','concat','-safe','0','-i',list,'-c','copy',outPath]);
 }
@@ -77,14 +83,18 @@ async function processJob(job){
   const dir=path.join(ROOT,job.id);await fs.mkdir(dir,{recursive:true});
   try{
     setJob(job.id,{status:'downloading',progress:10});const input=path.join(dir,'source.mp4');
-    if(job.url)await run(YTDLP,['--no-playlist','--no-warnings','--merge-output-format','mp4','-o',input,job.url]);else await fs.copyFile(job.uploadPath,input);
+    if(job.url){
+      // Download video only when possible. This avoids downloading the original audio because it is replaced anyway.
+      // Prefer H.264/MP4 so the final MP4 can keep the original video stream without re-encoding.
+      await run(YTDLP,['--no-playlist','--no-warnings','-f','bv*[ext=mp4][vcodec^=avc1]/bv*[ext=mp4]/b[ext=mp4]','-o',input,job.url]);
+    }else await fs.copyFile(job.uploadPath,input);
     setJob(job.id,{status:'reading captions',progress:35});const transcript=job.url?await getTranscriptFromCaptions(dir,job.url):null;
     if(!transcript)throw new Error('For keyless mode, the video must have captions. Use a YouTube video with subtitles enabled.');
     setJob(job.id,{status:'translating',progress:55});const translated=await translate(transcript,langCodes[job.language]);
     setJob(job.id,{status:'generating voice',progress:72});const dubbed=path.join(dir,'dub.mp3');await tts(translated,job.language,dubbed,dir);
     setJob(job.id,{status:'rendering video',progress:88});const output=path.join(dir,'translated.mp4');
     // Original video stream is copied without re-encoding; only the audio stream is replaced.
-    await run(FFMPEG,['-y','-i',input,'-i',dubbed,'-map','0:v:0','-map','1:a:0','-c:v','copy','-c:a','aac','-b:a','128k',output]);
+    await run(FFMPEG,['-y','-i',input,'-i',dubbed,'-map','0:v:0','-map','1:a:0','-c:v','copy','-c:a','aac','-b:a','128k','-movflags','+faststart',output]);
     setJob(job.id,{status:'ready',progress:100,videoUrl:`/files/${job.id}/translated.mp4`});
   }catch(e){setJob(job.id,{status:'error',progress:0,error:e?.message||'Dubbing failed.'});}
   finally{if(job.uploadPath)await fs.unlink(job.uploadPath).catch(()=>{});}
